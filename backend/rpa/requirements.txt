@@ -1,0 +1,32 @@
+# API Framework
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+
+# Data Validation
+pydantic==2.6.1
+pydantic-settings==2.1.0
+
+# MongoDB
+pymongo==4.6.1
+
+# Azure Storage
+azure-storage-blob==12.19.0
+
+# Celery & Redis
+celery==5.3.6
+redis==5.0.1
+
+# Data Processing
+pandas==2.2.0
+openpyxl==3.1.2
+
+# Utilities
+python-dotenv==1.0.1
+
+# Selenium (RPA - eLaw COGNA)
+selenium==4.18.1
+webdriver-manager==4.0.1
+
+# Logging e Monitoring (opcional)
+# python-json-logger==2.0.7

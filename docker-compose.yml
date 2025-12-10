@@ -1,0 +1,229 @@
+# =============================================================================
+# Portal AutoDev - Docker Compose Unificado
+# Frontend + Backend API + RPA Workers + Infraestrutura
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # ===========================================================================
+  # INFRAESTRUTURA
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Redis - Message Broker para Celery
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: autodev-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - autodev-network
+
+  # ---------------------------------------------------------------------------
+  # MongoDB - Banco de dados (opcional, use Atlas em producao)
+  # ---------------------------------------------------------------------------
+  mongodb:
+    image: mongo:7
+    container_name: autodev-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-admin123}
+      MONGO_INITDB_DATABASE: ${MONGODB_DB_NAME:-portal_autodev}
+    volumes:
+      - mongodb_data:/data/db
+      - ./docker/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - autodev-network
+    profiles:
+      - with-mongodb
+
+  # ===========================================================================
+  # FRONTEND - React/Vite
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: autodev-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8001/api
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - autodev-network
+    command: npm run dev -- --host
+
+  # ===========================================================================
+  # BACKEND API - FastAPI Portal
+  # ===========================================================================
+  api:
+    build:
+      context: ./backend/api
+      dockerfile: Dockerfile
+    container_name: autodev-api
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - MONGODB_URI=${MONGODB_URI:-mongodb://admin:admin123@mongodb:27017}
+      - MONGODB_DB_NAME=${MONGODB_DB_NAME:-portal_autodev}
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-your-secret-key-change-in-production}
+      - JWT_ALGORITHM=HS256
+      - JWT_EXPIRATION_HOURS=24
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
+      - AZURE_STORAGE_CONTAINER=${AZURE_STORAGE_CONTAINER:-portal-documentos}
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+    volumes:
+      - ./backend/api:/app
+      - api_downloads:/app/downloads
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - autodev-network
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+  # ===========================================================================
+  # RPA WORKERS - Celery + Selenium
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # RPA Worker - Processa downloads de documentos
+  # ---------------------------------------------------------------------------
+  rpa-worker:
+    build:
+      context: ./backend/rpa
+      dockerfile: Dockerfile
+    container_name: autodev-rpa-worker
+    restart: unless-stopped
+    environment:
+      - MONGODB_URL=${MONGODB_URI:-mongodb://admin:admin123@mongodb:27017}
+      - MONGODB_DB_NAME=${MONGODB_DB_NAME:-portal_autodev}
+      - PORTAL_MONGODB_DB_NAME=${MONGODB_DB_NAME:-portal_autodev}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - USE_LOCAL_STORAGE=${USE_LOCAL_STORAGE:-true}
+      - LOCAL_STORAGE_PATH=/app/downloads
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
+      - ELAW_USERNAME=${ELAW_USERNAME:-}
+      - ELAW_PASSWORD=${ELAW_PASSWORD:-}
+      - BCLEGAL_USER=${BCLEGAL_USER:-}
+      - BCLEGAL_PASSWORD=${BCLEGAL_PASSWORD:-}
+      - LEXXY_USER=${LEXXY_USER:-}
+      - LEXXY_PASSWORD=${LEXXY_PASSWORD:-}
+      - PORTAL_INTEGRATION_ENABLED=true
+      - PORTAL_BEAT_SCHEDULE_MINUTES=${PORTAL_BEAT_SCHEDULE_MINUTES:-5}
+      # Chrome headless
+      - DISPLAY=:99
+      - CHROME_BIN=/usr/bin/google-chrome
+    volumes:
+      - rpa_downloads:/app/downloads
+      - rpa_logs:/app/logs
+      - rpa_temp:/app/temp_downloads
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - autodev-network
+    command: celery -A portal_worker worker --loglevel=info --concurrency=2
+
+  # ---------------------------------------------------------------------------
+  # RPA Beat - Agendador de tarefas
+  # ---------------------------------------------------------------------------
+  rpa-beat:
+    build:
+      context: ./backend/rpa
+      dockerfile: Dockerfile
+    container_name: autodev-rpa-beat
+    restart: unless-stopped
+    environment:
+      - MONGODB_URL=${MONGODB_URI:-mongodb://admin:admin123@mongodb:27017}
+      - MONGODB_DB_NAME=${MONGODB_DB_NAME:-portal_autodev}
+      - PORTAL_MONGODB_DB_NAME=${MONGODB_DB_NAME:-portal_autodev}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - PORTAL_INTEGRATION_ENABLED=true
+      - PORTAL_BEAT_SCHEDULE_MINUTES=${PORTAL_BEAT_SCHEDULE_MINUTES:-5}
+    volumes:
+      - rpa_beat:/app/celerybeat-schedule
+    depends_on:
+      redis:
+        condition: service_healthy
+      rpa-worker:
+        condition: service_started
+    networks:
+      - autodev-network
+    command: celery -A portal_worker beat --loglevel=info
+
+  # ===========================================================================
+  # MONITORAMENTO (Opcional)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Flower - Dashboard do Celery
+  # ---------------------------------------------------------------------------
+  flower:
+    image: mher/flower:2.0
+    container_name: autodev-flower
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - FLOWER_PORT=5555
+      - FLOWER_BASIC_AUTH=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin123}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - autodev-network
+    profiles:
+      - monitoring
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  redis_data:
+  mongodb_data:
+  api_downloads:
+  rpa_downloads:
+  rpa_logs:
+  rpa_temp:
+  rpa_beat:
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  autodev-network:
+    driver: bridge

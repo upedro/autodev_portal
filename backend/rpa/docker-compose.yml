@@ -1,0 +1,283 @@
+# =============================================================================
+# RPA FluxLaw - Docker Compose
+# Orquestração completa: API + Worker + Beat + Redis + MongoDB
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # Redis - Message Broker para Celery
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: rpa-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rpa-network
+
+  # ---------------------------------------------------------------------------
+  # MongoDB - Banco de dados (opcional, use se não tiver Atlas)
+  # ---------------------------------------------------------------------------
+  mongodb:
+    image: mongo:7
+    container_name: rpa-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-admin123}
+      MONGO_INITDB_DATABASE: ${MONGODB_DB_NAME:-projeto_fluxlaw}
+    volumes:
+      - mongodb_data:/data/db
+      - ./docker/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rpa-network
+    profiles:
+      - with-mongodb  # Só inicia se usar --profile with-mongodb
+
+  # ---------------------------------------------------------------------------
+  # API - FastAPI Application
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: rpa-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_URL=${MONGODB_URL:-mongodb://admin:admin123@mongodb:27017/projeto_fluxlaw?authSource=admin}
+      - MONGODB_DB_NAME=${MONGODB_DB_NAME:-projeto_fluxlaw}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - USE_LOCAL_STORAGE=${USE_LOCAL_STORAGE:-true}
+      - LOCAL_STORAGE_PATH=/app/downloads
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
+      - ELAW_USERNAME=${ELAW_USERNAME:-}
+      - ELAW_PASSWORD=${ELAW_PASSWORD:-}
+      - BCLEGAL_USER=${BCLEGAL_USER:-}
+      - BCLEGAL_PASSWORD=${BCLEGAL_PASSWORD:-}
+      - LEXXY_USER=${LEXXY_USER:-}
+      - LEXXY_PASSWORD=${LEXXY_PASSWORD:-}
+      - PORTAL_INTEGRATION_ENABLED=${PORTAL_INTEGRATION_ENABLED:-false}
+    volumes:
+      - downloads_data:/app/downloads
+      - logs_data:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - rpa-network
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+
+  # ---------------------------------------------------------------------------
+  # Worker - Celery Worker para processamento RPA
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: rpa-worker
+    restart: unless-stopped
+    environment:
+      - MONGODB_URL=${MONGODB_URL:-mongodb://admin:admin123@mongodb:27017/projeto_fluxlaw?authSource=admin}
+      - MONGODB_DB_NAME=${MONGODB_DB_NAME:-projeto_fluxlaw}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - USE_LOCAL_STORAGE=${USE_LOCAL_STORAGE:-true}
+      - LOCAL_STORAGE_PATH=/app/downloads
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
+      - ELAW_USERNAME=${ELAW_USERNAME:-}
+      - ELAW_PASSWORD=${ELAW_PASSWORD:-}
+      - BCLEGAL_USER=${BCLEGAL_USER:-}
+      - BCLEGAL_PASSWORD=${BCLEGAL_PASSWORD:-}
+      - LEXXY_USER=${LEXXY_USER:-}
+      - LEXXY_PASSWORD=${LEXXY_PASSWORD:-}
+      - PORTAL_INTEGRATION_ENABLED=${PORTAL_INTEGRATION_ENABLED:-false}
+      # Chrome headless settings
+      - DISPLAY=:99
+      - CHROME_BIN=/usr/bin/google-chrome
+    volumes:
+      - downloads_data:/app/downloads
+      - logs_data:/app/logs
+      - temp_downloads:/app/temp_downloads
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rpa-network
+    command: celery -A worker worker --loglevel=info --concurrency=2
+
+  # ---------------------------------------------------------------------------
+  # Beat - Celery Beat Scheduler
+  # ---------------------------------------------------------------------------
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: rpa-beat
+    restart: unless-stopped
+    environment:
+      - MONGODB_URL=${MONGODB_URL:-mongodb://admin:admin123@mongodb:27017/projeto_fluxlaw?authSource=admin}
+      - MONGODB_DB_NAME=${MONGODB_DB_NAME:-projeto_fluxlaw}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - BEAT_SCHEDULE_MINUTES=${BEAT_SCHEDULE_MINUTES:-10}
+      - PORTAL_BEAT_SCHEDULE_MINUTES=${PORTAL_BEAT_SCHEDULE_MINUTES:-5}
+      - PORTAL_INTEGRATION_ENABLED=${PORTAL_INTEGRATION_ENABLED:-false}
+    volumes:
+      - beat_data:/app/celerybeat-schedule
+    depends_on:
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    networks:
+      - rpa-network
+    command: celery -A worker beat --loglevel=info
+
+  # ---------------------------------------------------------------------------
+  # Portal Worker - Celery Worker para integração com Portal Web
+  # ---------------------------------------------------------------------------
+  portal-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: rpa-portal-worker
+    restart: unless-stopped
+    environment:
+      - MONGODB_URL=${MONGODB_URL:-mongodb://admin:admin123@mongodb:27017/projeto_fluxlaw?authSource=admin}
+      - MONGODB_DB_NAME=${MONGODB_DB_NAME:-projeto_fluxlaw}
+      - PORTAL_MONGODB_DB_NAME=${PORTAL_MONGODB_DB_NAME:-portal_rpa}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - USE_LOCAL_STORAGE=${USE_LOCAL_STORAGE:-true}
+      - LOCAL_STORAGE_PATH=/app/downloads
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
+      - ELAW_USERNAME=${ELAW_USERNAME:-}
+      - ELAW_PASSWORD=${ELAW_PASSWORD:-}
+      - BCLEGAL_USER=${BCLEGAL_USER:-}
+      - BCLEGAL_PASSWORD=${BCLEGAL_PASSWORD:-}
+      - LEXXY_USER=${LEXXY_USER:-}
+      - LEXXY_PASSWORD=${LEXXY_PASSWORD:-}
+      - PORTAL_INTEGRATION_ENABLED=true
+      - PORTAL_BEAT_SCHEDULE_MINUTES=${PORTAL_BEAT_SCHEDULE_MINUTES:-5}
+      # Chrome headless settings
+      - DISPLAY=:99
+      - CHROME_BIN=/usr/bin/google-chrome
+    volumes:
+      - downloads_data:/app/downloads
+      - logs_data:/app/logs
+      - temp_downloads:/app/temp_downloads
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rpa-network
+    command: celery -A portal_worker worker --loglevel=info --concurrency=2
+    profiles:
+      - portal  # Só inicia se usar --profile portal
+
+  # ---------------------------------------------------------------------------
+  # Portal Beat - Celery Beat para Portal (agendador separado)
+  # ---------------------------------------------------------------------------
+  portal-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: rpa-portal-beat
+    restart: unless-stopped
+    environment:
+      - MONGODB_URL=${MONGODB_URL:-mongodb://admin:admin123@mongodb:27017/projeto_fluxlaw?authSource=admin}
+      - MONGODB_DB_NAME=${MONGODB_DB_NAME:-projeto_fluxlaw}
+      - PORTAL_MONGODB_DB_NAME=${PORTAL_MONGODB_DB_NAME:-portal_rpa}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - PORTAL_INTEGRATION_ENABLED=true
+      - PORTAL_BEAT_SCHEDULE_MINUTES=${PORTAL_BEAT_SCHEDULE_MINUTES:-5}
+    volumes:
+      - beat_data:/app/celerybeat-schedule
+    depends_on:
+      redis:
+        condition: service_healthy
+      portal-worker:
+        condition: service_started
+    networks:
+      - rpa-network
+    command: celery -A portal_worker beat --loglevel=info
+    profiles:
+      - portal  # Só inicia se usar --profile portal
+
+  # ---------------------------------------------------------------------------
+  # Flower - Monitoramento do Celery (opcional)
+  # ---------------------------------------------------------------------------
+  flower:
+    image: mher/flower:2.0
+    container_name: rpa-flower
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - FLOWER_PORT=5555
+      - FLOWER_BASIC_AUTH=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin123}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rpa-network
+    profiles:
+      - monitoring  # Só inicia se usar --profile monitoring
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  redis_data:
+    driver: local
+  mongodb_data:
+    driver: local
+  downloads_data:
+    driver: local
+  logs_data:
+    driver: local
+  temp_downloads:
+    driver: local
+  beat_data:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  rpa-network:
+    driver: bridge
